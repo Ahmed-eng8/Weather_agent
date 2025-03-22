@@ -1,5 +1,8 @@
 import os
 import requests
+from datetime import datetime
+from typing import Optional
+from dataclasses import dataclass
 from dotenv import load_dotenv
 import chainlit as cl
 from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
@@ -9,7 +12,7 @@ from agents.tool import function_tool
 # Load environment variables
 load_dotenv()
 
-# Load API keys securely from .env
+# API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
@@ -22,31 +25,29 @@ if not WEATHER_API_KEY:
 # OpenWeatherMap API URL
 WEATHER_API_URL = "https://api.openweathermap.org/data/2.5/weather"
 
-# Chat starters
-@cl.set_starters
-async def set_starts():
-    return [
-        cl.Starter(label="Greetings", message="Hello! How can I assist you today?"),
-        cl.Starter(label="Weather", message="Find the weather in Karachi."),
-    ]
+@dataclass
+class WeatherInfo:
+    temperature: float
+    feels_like: float
+    humidity: int
+    description: str
+    wind_speed: float
+    pressure: int
+    location_name: str
+    rain_1h: Optional[float] = None
+    visibility: Optional[int] = None
 
-# Weather fetching function
 @function_tool
 @cl.step(type="weather tool")
 def get_weather(location: str, unit: str = "metric") -> str:
     """
     Fetches real-time weather data for a given location.
-    
-    Args:
-        location (str): City name (e.g., "Karachi").
-        unit (str): Measurement unit ("metric" for Celsius, "imperial" for Fahrenheit).
-
-    Returns:
-        str: A formatted weather description.
     """
     try:
+        normalized_location = location.strip().title()
+
         params = {
-            "q": location,
+            "q": normalized_location,
             "appid": WEATHER_API_KEY,
             "units": unit,
         }
@@ -54,86 +55,95 @@ def get_weather(location: str, unit: str = "metric") -> str:
         response.raise_for_status()
         data = response.json()
 
-        # Validate API response
         if data.get("cod") != 200:
             return f"Error fetching weather: {data.get('message', 'Unknown error')}"
 
-        weather_desc = data["weather"][0]["description"]
-        temperature = data["main"]["temp"]
-        return f"The weather in {location} is {weather_desc} with a temperature of {temperature}°C."
+        weather_info = WeatherInfo(
+            temperature=data["main"]["temp"],
+            feels_like=data["main"]["feels_like"],
+            humidity=data["main"]["humidity"],
+            description=data["weather"][0]["description"],
+            wind_speed=data["wind"]["speed"],
+            pressure=data["main"]["pressure"],
+            location_name=data["name"],
+            visibility=data.get("visibility"),
+            rain_1h=data.get("rain", {}).get("1h"),
+        )
 
+        return (
+            f"Weather in {weather_info.location_name}:\n"
+            f"- Temperature: {weather_info.temperature}°C (feels like {weather_info.feels_like}°C)\n"
+            f"- Conditions: {weather_info.description}\n"
+            f"- Humidity: {weather_info.humidity}%\n"
+            f"- Wind speed: {weather_info.wind_speed} m/s\n"
+            f"- Pressure: {weather_info.pressure} hPa\n\n"
+            f"Stay tuned for personalized weather suggestions!"
+        )
     except requests.RequestException as e:
         return f"Failed to fetch weather: {e}"
 
-# Chat session setup
+# Create a weather assistant
+weather_assistant = Agent(
+   name="Weather Assistant",
+   instructions="""You are a weather assistant that provides current weather information.
+
+   When asked about the weather, use the get_weather tool to fetch accurate data.
+   If the user doesn't specify a country code and ambiguity exists,
+   ask for clarification (e.g., Paris, France vs. Paris, Texas).
+
+   In addition to weather details, always generate friendly commentary,
+   including clothing suggestions or activity recommendations based on conditions.
+   """,
+   tools=[get_weather]
+)
+
 @cl.on_chat_start
 async def start():
-    """Initializes the assistant when a user starts a chat session."""
-
-    # Create an AI client dynamically
     external_client = AsyncOpenAI(
         api_key=GEMINI_API_KEY,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
-
     model = OpenAIChatCompletionsModel(
         model="gemini-2.0-flash",
         openai_client=external_client,
     )
-
-    config = RunConfig(
+    config = RunConfig(model=model, model_provider=external_client, tracing_disabled=True)
+    
+    # Initialize agent
+    agent = Agent(
+        name="Weather Assistant",
+        instructions=weather_assistant.instructions,
         model=model,
-        model_provider=external_client,
-        tracing_disabled=True,
+        tools=[get_weather]
     )
-
-    # Store configurations in session
+    
     cl.user_session.set("chat_history", [])
     cl.user_session.set("config", config)
-
-    # Create and register agent dynamically
-    agent = Agent(name="Assistant", instructions="You are a helpful assistant", model=model)
-    agent.tools.extend([get_weather])
     cl.user_session.set("agent", agent)
+    
+    await cl.Message(content="Welcome! Check the latest weather updates for your location.").send()
 
-    await cl.Message(content="Welcome to the AI Assistant! How can I help you today?").send()
-
-# Handle incoming messages
 @cl.on_message
 async def main(message: cl.Message):
-    """Processes user messages and generates responses dynamically."""
-
-    # Temporary thinking response
     msg = cl.Message(content="Thinking...")
     await msg.send()
-
-    # Retrieve session data
+    
     agent = cl.user_session.get("agent")
     config = cl.user_session.get("config")
     history = cl.user_session.get("chat_history") or []
-
-    # Append user message to history
+    
     history.append({"role": "user", "content": message.content})
 
     try:
-        print("\n[CALLING AGENT]\n", history, "\n")
         result = Runner.run_sync(agent, history, run_config=config)
-
         response_content = result.final_output
 
-        # Update message with response
+
         msg.content = response_content
         await msg.update()
 
-        # Append AI response to history
         history.append({"role": "assistant", "content": response_content})
         cl.user_session.set("chat_history", history)
-
-        # Log interaction
-        print(f"User: {message.content}")
-        print(f"Assistant: {response_content}")
-
     except Exception as e:
         msg.content = f"Error: {str(e)}"
         await msg.update()
-        print(f"Error: {str(e)}")
